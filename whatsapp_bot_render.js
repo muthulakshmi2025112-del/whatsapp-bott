@@ -13,51 +13,68 @@ let qrCodeData = null;
 let isReady = false;
 let qrCodeImage = null;
 
+// ✅ Singleton lock - prevent multiple instances
+const lockFile = './.bot_lock';
+if (fs.existsSync(lockFile)) {
+    console.log('⚠️ Bot already running, exiting duplicate...');
+    process.exit(0);
+}
+fs.writeFileSync(lockFile, Date.now().toString());
+
+// Clean lock on exit
+process.on('exit', () => {
+    try { fs.unlinkSync(lockFile); } catch(e) {}
+});
+
 // ✅ Session path with unique ID for your bot
 const sessionPath = './whatsapp_session';
-const clientId = 'lsk-clinic-permanent';  // 🔑 FIXED ID - very important!
+const clientId = 'lsk-clinic-permanent';
 
-// ⚠️ One-time cleanup: Delete old corrupted session
-if (process.env.CLEAN_SESSION === 'true') {
-    if (fs.existsSync(sessionPath)) {
-        fs.rmSync(sessionPath, { recursive: true, force: true });
-        console.log('🧹 Session cleaned - will need fresh QR scan');
-    }
-}
-
-// ✅ Fixed Client Configuration
+// ✅ Fixed Client Configuration with RESTART RECOVERY
 const client = new Client({
     authStrategy: new LocalAuth({
         dataPath: sessionPath,
-        clientId: clientId  // 🔑 Same ID every time - session persists!
+        clientId: clientId
     }),
     puppeteer: {
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
             '--disable-dev-shm-usage',
-            '--single-process',  // ✅ Critical for Render free tier
+            '--single-process',
             '--disable-gpu',
             '--disable-extensions',
             '--no-zygote'
         ],
-        headless: true
+        headless: true,
+        // ✅ Important: Handle browser crashes
+        handleSIGINT: true,
+        handleSIGTERM: true,
+        handleSIGHUP: true
     }
 });
 
-// ✅ Event Handlers
+// ✅ Event Handlers with proper state management
+let isProcessing = false;
+
 client.on('authenticated', () => {
+    if (isProcessing) return;
+    isProcessing = true;
     console.log('✅ Client AUTHENTICATED - Session saved permanently');
     isReady = true;
     qrCodeData = null;
     qrCodeImage = null;
+    setTimeout(() => { isProcessing = false; }, 1000);
 });
 
 client.on('ready', () => {
+    if (isProcessing) return;
+    isProcessing = true;
     console.log('✅ Client READY - Bot is online! Session restored from disk');
     isReady = true;
     qrCodeData = null;
     qrCodeImage = null;
+    setTimeout(() => { isProcessing = false; }, 1000);
 });
 
 client.on('auth_failure', (msg) => {
@@ -66,7 +83,11 @@ client.on('auth_failure', (msg) => {
 });
 
 client.on('qr', async (qr) => {
-    console.log('🔄 New QR Code generated (first time only)');
+    if (isReady) {
+        console.log('⚠️ QR received but bot already ready - ignoring');
+        return;
+    }
+    console.log('🔄 New QR Code generated');
     qrCodeData = qr;
     try {
         qrCodeImage = await qrcode.toDataURL(qr);
@@ -82,17 +103,19 @@ client.on('disconnected', (reason) => {
 });
 
 client.on('loading_screen', (percent, message) => {
-    console.log(`⏳ Loading: ${percent}% - ${message}`);
+    if (percent > 90 && percent < 100) {
+        console.log(`⏳ Loading: ${percent}% - ${message}`);
+    }
 });
 
 // Initialize
 client.initialize();
 
-// Routes
+// ✅ Routes
 app.get('/', (req, res) => {
     res.send(`
         <html>
-        <head><title>WhatsApp Bot</title></head>
+        <head><title>WhatsApp Bot</title><meta http-equiv="refresh" content="10"></head>
         <body style="text-align:center;font-family:Arial;padding:20px;">
             <h1>📱 WhatsApp Bot</h1>
             <div id="status"></div>
@@ -102,15 +125,17 @@ app.get('/', (req, res) => {
                     const resp = await fetch('/status');
                     const data = await resp.json();
                     if(data.ready){
-                        document.getElementById('status').innerHTML='<h2 style="color:green">✅ Bot is READY!</h2>';
-                        document.getElementById('qr').innerHTML='';
+                        document.getElementById('status').innerHTML='<h2 style="color:green">✅ Bot is READY and Connected!</h2>';
+                        document.getElementById('qr').innerHTML='<p>Session active. No QR needed.</p>';
                     } else if(data.qr){
                         document.getElementById('status').innerHTML='<h2 style="color:orange">⏳ Scan QR Code</h2>';
                         document.getElementById('qr').innerHTML='<img src="'+data.qr+'" width="300">';
+                    } else {
+                        document.getElementById('status').innerHTML='<h2 style="color:gray">⏳ Initializing...</h2>';
                     }
                 }
                 checkStatus();
-                setInterval(checkStatus, 3000);
+                setInterval(checkStatus, 5000);
             </script>
         </body>
         </html>
@@ -121,27 +146,20 @@ app.get('/qr-page', async (req, res) => {
     if (qrCodeImage && !isReady) {
         res.send(`
             <html>
-            <head><title>Scan QR</title>
-            <meta http-equiv="refresh" content="5">
-            </head>
+            <head><title>Scan QR</title></head>
             <body style="text-align:center;font-family:Arial;padding:20px;">
                 <h1>📱 Scan with WhatsApp</h1>
                 <img src="${qrCodeImage}" width="300">
                 <p>Open WhatsApp → Settings → Linked Devices → Link a Device</p>
-                <script>
-                    setInterval(()=>{
-                        fetch('/status').then(r=>r.json()).then(data=>{
-                            if(data.ready) location.reload();
-                        });
-                    },3000);
-                </script>
+                <p>Status: ${isReady ? '✅ Connected' : '⏳ Waiting for scan'}</p>
+                <a href="/qr-page">Refresh</a>
             </body>
             </html>
         `);
     } else if (isReady) {
         res.send('<h1>✅ Already Connected!</h1><p>Bot is ready. Session saved permanently.</p><a href="/">Home</a>');
     } else {
-        res.send('<h1>⏳ Loading...</h1><p>Initializing, please wait.</p><meta http-equiv="refresh" content="3">');
+        res.send('<h1>⏳ Loading...</h1><p>Initializing, please wait.</p><a href="/qr-page">Refresh</a>');
     }
 });
 
@@ -157,7 +175,7 @@ app.post('/send', async (req, res) => {
     const { number, message } = req.body;
     
     if (!isReady) {
-        return res.status(503).json({ error: 'Bot not ready. Please scan QR code first.' });
+        return res.status(503).json({ error: 'Bot not ready. Please check /qr-page' });
     }
     
     if (!number || !message) {
@@ -178,15 +196,22 @@ app.post('/send', async (req, res) => {
     }
 });
 
-// ✅ Keep alive every 45 seconds
+// ✅ Keep alive every 30 seconds - prevents spin down
 setInterval(() => {
     if (isReady) {
         console.log('💓 Bot is alive - session active');
     }
-}, 45000);
+}, 30000);
 
 app.listen(PORT, () => {
     console.log(`✅ WhatsApp Bot running on port ${PORT}`);
     console.log(`📱 QR Page: https://whatsapp-bott-iu4h.onrender.com/qr-page`);
-    console.log(`🔑 Client ID: ${clientId} - Session will persist after first scan`);
+    console.log(`🔑 Session will persist after first scan`);
+});
+
+// ✅ Handle cleanup
+process.on('SIGTERM', () => {
+    console.log('SIGTERM received, cleaning up...');
+    client.destroy();
+    process.exit(0);
 });
